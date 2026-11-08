@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+data/
+*.egg-info/
+.mcp.json
+.env
+.env.*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.jsonl

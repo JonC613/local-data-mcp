@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-data-mcp"
+version = "0.1.0"
+description = "Local deterministic mock data lookup tools exposed over MCP"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.26,<2"]
+
+[project.scripts]
+local-data-mcp = "local_data_mcp.cli:main"
+phish-import = "local_data_mcp.phish_importer:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

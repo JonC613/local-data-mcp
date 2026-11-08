@@ -1,0 +1,3 @@
+interface:
+  display_name: "Dataset to MCP"
+  short_description: "Create audited SQLite MCP lookups"
