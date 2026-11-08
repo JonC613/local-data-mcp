@@ -36,10 +36,15 @@ class AuditWriter:
 
     def write(self, event: dict[str, Any]) -> None:
         """Append one complete line; failures are surfaced to the caller."""
-        line = json.dumps(event, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n"
+        line = (json.dumps(event, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8", newline="\n") as stream:
+            with self.path.open("a+b") as stream:
+                stream.seek(0, os.SEEK_END)
+                if stream.tell():
+                    stream.seek(-1, os.SEEK_END)
+                    if stream.read(1) != b"\n":
+                        raise OSError("Audit log ends with an incomplete line; append refused.")
                 stream.write(line)
                 stream.flush()
                 os.fsync(stream.fileno())

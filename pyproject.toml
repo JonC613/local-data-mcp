@@ -12,9 +12,13 @@ dependencies = ["mcp>=1.26,<2"]
 [project.scripts]
 local-data-mcp = "local_data_mcp.cli:main"
 phish-import = "local_data_mcp.phish_importer:main"
+local-data-viewer = "local_data_mcp.viewer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+local_data_mcp = ["viewer_static/*.html", "viewer_static/*.css", "viewer_static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

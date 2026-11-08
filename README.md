@@ -39,6 +39,22 @@ The MCP provides fixed, read-only Phish tools: `phish_find_shows` searches venue
 
 Example questions after the first import: “Find Phish shows at Madison Square Garden in 1995”, “Show the setlist for 1997-11-17”, and “Find performances of Harry Hood.”
 
+## View local databases and audits
+
+From this project folder, start the local browser viewer:
+
+    .\.venv\Scripts\python.exe -m local_data_mcp.viewer
+
+The command opens a browser and prints a session link. Keep the terminal open while using the viewer; press Ctrl+C to stop it. If a browser does not open automatically, copy the complete printed link into a browser. The link contains the local session secret, so do not share it. Pass `--no-browser` to skip opening a browser, or `--port 8765` to use a specific loopback port.
+
+Choose **Mock database** or **Phish database**, select an approved table, and use a column filter and pagination to browse its rows. Select a cell to inspect its complete value. The **Audit log** view filters by tool, outcome, request ID, and time; select an event to inspect its recorded arguments and response. Version 1 records may contain earlier truncation markers. The viewer keeps the audit list at a fixed file snapshot while paging; refresh the view to include later events.
+
+The viewer defaults to `data/mock.sqlite`, `data/phish.sqlite`, and `data/audit.jsonl` relative to the launch folder. Override them using `LOCAL_DATA_MCP_DB_PATH`, `LOCAL_DATA_MCP_PHISH_DB_PATH`, and `LOCAL_DATA_MCP_AUDIT_PATH`, or the `--mock-db`, `--phish-db`, and `--audit-log` options. SQLite connections are read-only and there is no SQL console. The service binds to `127.0.0.1` with a per-launch session secret; it is intended for local use, not a multi-user or remote deployment.
+
+Viewing data is itself recorded to the configured audit log, including the complete request and response. Viewing prior audit records can therefore duplicate data in the log and increase its size. If writing the audit record fails, the viewer withholds the data. The log remains editable and is not tamper-proof.
+
+If the audit log ends with an incomplete JSONL line, new audit appends are refused to avoid joining a new event to the damaged line. The viewer identifies the incomplete line and withholds data until the log is repaired or an intact audit path is configured.
+
 ## Use with GitHub Copilot
 
 Copy `.mcp.example.json` to `.mcp.json` and replace each `<PROJECT_ROOT>` with the absolute path of this checkout (JSON paths on Windows require doubled backslashes). The example uses the Windows virtual environment path; on other platforms use the appropriate Python executable and path separators. The local `.mcp.json` is ignored by Git because its paths are specific to your machine.
@@ -103,6 +119,10 @@ Try “Show the latest audit events”, “Find audit events for phish_get_show�
 The server uses MCP stdio, so VS Code or another MCP client should start and manage the process. To run the project test suite during development:
 
     .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+
+## Continuous integration
+
+GitHub Actions installs the project and runs the test suite on pushes, pull requests, and manual runs. The matrix covers Windows and Linux with Python 3.11 and 3.13. The checks use temporary synthetic data and do not upload the local SQLite databases or audit log.
 
 ## Future work
 

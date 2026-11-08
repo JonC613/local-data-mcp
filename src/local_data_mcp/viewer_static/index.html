@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Data Viewer</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">◈</span><div><strong>Local Data</strong><small>VIEWER</small></div></div>
+      <div class="nav-label">WORKSPACE</div>
+      <nav aria-label="Data sources">
+        <button class="nav-item" data-source="mock" aria-label="Mock database" title="Mock database"><span class="nav-icon">▤</span><span>Mock database</span><span class="nav-arrow">›</span></button>
+        <button class="nav-item" data-source="phish" aria-label="Phish database" title="Phish database"><span class="nav-icon">◉</span><span>Phish database</span><span class="nav-arrow">›</span></button>
+        <button class="nav-item" data-source="audit" aria-label="Audit log" title="Audit log"><span class="nav-icon">≡</span><span>Audit log</span><span class="nav-arrow">›</span></button>
+      </nav>
+      <div class="sidebar-bottom"><span class="status-dot"></span><span>Local connection<br><small>Data stays on this machine</small></span></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><span>WORKSPACE <span class="crumb">/</span> <span id="breadcrumb">OVERVIEW</span></span><span class="local-pill"><span class="status-dot"></span> LOCAL SESSION</span></header>
+      <div class="content">
+        <section class="page-heading"><div><div class="eyebrow" id="eyebrow">YOUR LOCAL WORKSPACE</div><h1 id="title">Your data, in view.</h1><p id="subtitle">Explore your databases and follow the activity behind each lookup.</p></div><button id="refresh" class="button secondary" hidden>↻ &nbsp; Refresh</button></section>
+        <div id="notice" class="notice" role="status" hidden></div>
+        <section id="welcome" class="welcome">
+          <div class="welcome-intro"><div class="welcome-icon">⌁</div><h2>A clearer view of what's local.</h2><p>Choose a source to explore records or review the activity your tools have recorded.</p></div>
+          <div class="welcome-grid">
+            <button class="source-card" data-open="mock"><span class="card-icon blue">▤</span><strong>Mock database</strong><small>Browse customers, orders, and products.</small><span class="card-link">Explore database <b>↗</b></span></button>
+            <button class="source-card" data-open="phish"><span class="card-icon violet">◉</span><strong>Phish database</strong><small>Browse shows, tracks, songs, and syncs.</small><span class="card-link">Explore database <b>↗</b></span></button>
+            <button class="source-card" data-open="audit"><span class="card-icon amber">≡</span><strong>Audit log</strong><small>Inspect tool calls and their recorded results.</small><span class="card-link">Review activity <b>↗</b></span></button>
+          </div>
+          <div class="welcome-note"><span>◈</span><p><strong>Built for local exploration.</strong><br>Database browsing is read-only. Viewer requests are recorded in your audit log.</p></div>
+        </section>
+        <section id="database" hidden>
+          <div class="table-picker"><span class="section-label">TABLE</span><div id="table-tabs" class="tabs"></div></div>
+          <div class="panel"><div class="panel-header"><div><div class="section-label">DATABASE RECORDS</div><h2 id="table-title">Select a table</h2><p class="muted" id="table-description">Records are shown in a stable key order.</p></div><span class="read-only">READ ONLY</span></div>
+            <form id="table-filter" class="filter-bar"><label><span class="sr-only">Filter column</span><select id="filter-column"><option value="">Choose a column</option></select></label><label class="grow"><span class="sr-only">Filter value</span><input id="filter-query" placeholder="Find a value in this column" maxlength="200"></label><button class="button primary" type="submit">Apply filter</button><button class="button ghost" id="clear-filter" type="button">Clear</button></form>
+            <div id="table-scroll" class="table-scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+            <div class="panel-footer"><span id="table-page-info" class="muted"></span><div class="pagination"><button class="button secondary" id="table-prev">← Previous</button><button class="button secondary" id="table-next">Next →</button></div></div>
+          </div><p class="footnote">Data can change between page requests. Select a cell to see its complete value.</p>
+        </section>
+        <section id="audit" hidden>
+          <div class="audit-notice"><span>ⓘ</span><div><strong>Reviewing activity creates activity.</strong> Audit views and their full responses are recorded. This view holds a snapshot while you page through it; refresh to include new events.</div></div>
+          <div class="panel"><div class="panel-header"><div><div class="section-label">AUDIT TRAIL</div><h2>Recorded activity</h2><p class="muted">Find an event and open its arguments and response.</p></div><span class="read-only">JSONL</span></div>
+            <form id="audit-filter" class="audit-filters">
+              <label>TOOL NAME<input id="audit-tool" placeholder="e.g. phish_get_show" maxlength="200"></label>
+              <label>OUTCOME<select id="audit-outcome"><option value="">All outcomes</option><option value="success">Success</option><option value="error">Error</option><option value="invalid_input">Invalid input</option><option value="not_found">Not found</option></select></label>
+              <label class="wide">REQUEST ID<input id="audit-request" placeholder="Exact request ID" maxlength="200"></label>
+              <label>FROM <input id="audit-start" type="datetime-local"></label><label>TO <input id="audit-end" type="datetime-local"></label>
+              <div class="filter-actions"><button class="button primary" type="submit">Apply filters</button><button class="button ghost" id="audit-clear" type="button">Clear</button></div>
+            </form>
+            <div class="table-scroll"><table class="audit-table"><thead><tr><th>TIME</th><th>TOOL</th><th>OUTCOME</th><th>REQUEST ID</th><th></th></tr></thead><tbody id="audit-body"></tbody></table></div>
+            <div class="panel-footer"><span id="audit-page-info" class="muted"></span><div class="pagination"><button class="button secondary" id="audit-prev">← Previous</button><button class="button secondary" id="audit-next">Next →</button></div></div>
+          </div>
+        </section>
+      </div>
+      <footer class="main-footer"><span>LOCAL DATA VIEWER</span><span>Read-only databases &nbsp; • &nbsp; Audited access</span></footer>
+    </main>
+  </div>
+  <dialog id="detail-dialog"><div class="dialog-head"><div><div class="section-label" id="detail-label">RECORD DETAIL</div><h2 id="detail-title">Details</h2></div><button id="detail-close" class="close" aria-label="Close details">×</button></div><p id="detail-warning" class="detail-warning" hidden></p><pre id="detail-content"></pre></dialog>
+</body>
+</html>
