@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from collections import deque
 import json
+import os
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .audit import AuditWriter
 from .database import open_readonly
+from .phishnet import PhishNet, SourceError
 
 
 MAX_LIMIT = 50
@@ -21,6 +24,12 @@ DEFAULT_LIMIT = 20
 
 class InputError(ValueError):
     pass
+
+
+class CatalogError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def _positive_id(value: Any, label: str) -> int:
@@ -56,13 +65,27 @@ def _iso_date(value: Any, label: str) -> str:
     return value
 
 
+def _uuid(value: Any, label: str) -> str:
+    try:
+        if not isinstance(value, str) or str(UUID(value)) != value:
+            raise ValueError
+    except (ValueError, AttributeError) as exc:
+        raise InputError(f"{label} must be a canonical lowercase UUID.") from exc
+    return value
+
+
 class LookupService:
     """Small allowlisted interface over a read-only SQLite connection."""
 
-    def __init__(self, database_path: Path, audit: AuditWriter, phish_database_path: Path | None = None):
+    def __init__(self, database_path: Path, audit: AuditWriter, phish_database_path: Path | None = None,
+                 require_question_id: bool = False, attendance_database_path: Path | None = None):
         self.database_path = database_path
         self.audit = audit
         self.phish_database_path = phish_database_path
+        self.require_question_id = require_question_id
+        self.attendance_database_path = (attendance_database_path or Path(os.environ.get(
+            "LOCAL_DATA_MCP_ATTENDANCE_DB_PATH", "data/attendance.sqlite"))).expanduser().resolve()
+        self.phishnet = PhishNet()
 
     def _find_customers(self, args: dict[str, Any]) -> dict[str, Any]:
         query = args.get("query")
@@ -81,6 +104,36 @@ class LookupService:
                 (f"%{escaped}%", limit),
             ).fetchall()
         return {"customers": [dict(row) for row in rows]}
+
+    def _count_customers(self, args: dict[str, Any]) -> dict[str, Any]:
+        with closing(open_readonly(self.database_path)) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+        return {"customer_count": count}
+
+    def _find_customers_by_prefix(self, args: dict[str, Any]) -> dict[str, Any]:
+        prefix = _search_query(args.get("prefix"), "prefix")
+        limit = _limit(args.get("limit", DEFAULT_LIMIT))
+        offset = args.get("offset", 0)
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000:
+            raise InputError("offset must be an integer from 0 to 1000000.")
+        escaped = prefix.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with closing(open_readonly(self.database_path)) as connection:
+            rows = connection.execute(
+                """SELECT id, name, email FROM customers
+                   WHERE lower(name) LIKE lower(?) ESCAPE '\\'
+                   ORDER BY lower(name), id LIMIT ? OFFSET ?""",
+                (f"{escaped}%", limit + 1, offset),
+            ).fetchall()
+        return {"customers": [dict(row) for row in rows[:limit]], "offset": offset,
+                "limit": limit, "has_more": len(rows) > limit}
+
+    def _audit_record_question(self, args: dict[str, Any]) -> dict[str, Any]:
+        question = args.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise InputError("question must be a non-empty string.")
+        if not isinstance(args.get("retrospective", False), bool):
+            raise InputError("retrospective must be a boolean.")
+        return {"recorded": True}
 
     def _list_customer_orders(self, args: dict[str, Any]) -> dict[str, Any]:
         customer_id = _positive_id(args.get("customer_id"), "customer_id")
@@ -121,6 +174,186 @@ class LookupService:
         if self.phish_database_path is None:
             raise InputError("The local Phish catalog is not configured.")
         return open_readonly(self.phish_database_path)
+
+    def _attendance_path(self) -> Path:
+        path = self.attendance_database_path
+        protected = {self.database_path.expanduser().resolve(), self.audit.path.expanduser().resolve()}
+        if self.phish_database_path is not None:
+            protected.add(self.phish_database_path.expanduser().resolve())
+        if path in protected:
+            raise InputError("Attendance database path must differ from catalog, mock database and audit paths.")
+        return path
+
+    def _phish_add_attended_show(self, args: dict[str, Any]) -> dict[str, Any]:
+        show_date = _iso_date(args.get("show_date"), "show_date")
+        show_id = args.get("show_id")
+        if show_id is not None:
+            show_id = _positive_id(show_id, "show_id")
+        path = self._attendance_path()
+        with closing(self._phish_connection()) as catalog:
+            rows = catalog.execute("""SELECT id AS show_id, show_date, venue_name, city, state, country
+                FROM phish_shows WHERE show_date = ? AND (? IS NULL OR id = ?) ORDER BY id""",
+                (show_date, show_id, show_id)).fetchall()
+        if not rows:
+            return {"error": {"code": "not_found", "message": "No matching show was found in the local catalog."}}
+        if len(rows) != 1:
+            return {"error": {"code": "ambiguous_show", "message": "Multiple shows match that date; specify show_id."}}
+        show = dict(rows[0])
+        mutation_id = str(uuid4())
+        start = self.audit.make_event(tool="phish_add_attended_show_started",
+                                      arguments={**args, "mutation_id": mutation_id}, outcome="started")
+        try:
+            self.audit.write(start)
+        except (OSError, TypeError, ValueError, OverflowError, RecursionError):
+            raise SourceError("audit_failure", "Attendance was not changed because the start audit failed.") from None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("""CREATE TABLE IF NOT EXISTS attended_shows (
+                    show_id INTEGER PRIMARY KEY, show_date TEXT NOT NULL, venue_name TEXT, city TEXT,
+                    state TEXT, country TEXT, added_at_utc TEXT NOT NULL)""")
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                cursor = connection.execute("""INSERT OR IGNORE INTO attended_shows
+                    (show_id, show_date, venue_name, city, state, country, added_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""", (*show.values(), now))
+                inserted = cursor.rowcount == 1
+                connection.row_factory = sqlite3.Row
+                saved = dict(connection.execute("SELECT * FROM attended_shows WHERE show_id = ?", (show["show_id"],)).fetchone())
+                connection.commit()
+        except (OSError, sqlite3.Error) as exc:
+            raise CatalogError("attendance_write_failed", f"Attendance save could not be confirmed (mutation {mutation_id}); retrying is safe.") from exc
+        return {"added": inserted, "attendance": saved, "mutation_id": mutation_id}
+
+    def _phish_list_attended_shows(self, args: dict[str, Any]) -> dict[str, Any]:
+        year = args.get("year")
+        if year is not None and (isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= 2200):
+            raise InputError("year must be an integer from 1900 to 2200.")
+        limit = _limit(args.get("limit", DEFAULT_LIMIT))
+        offset = args.get("offset", 0)
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000:
+            raise InputError("offset must be an integer from 0 to 1000000.")
+        path = self._attendance_path()
+        if not path.exists():
+            return {"shows": [], "total": 0, "limit": limit, "offset": offset, "has_more": False}
+        where = " WHERE show_date >= ? AND show_date < ?" if year is not None else ""
+        params = (f"{year:04d}-01-01", f"{year + 1:04d}-01-01") if year is not None else ()
+        with closing(open_readonly(path)) as connection:
+            connection.execute("BEGIN")
+            total = connection.execute("SELECT COUNT(*) FROM attended_shows" + where, params).fetchone()[0]
+            rows = connection.execute("SELECT * FROM attended_shows" + where +
+                                      " ORDER BY show_date, show_id LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+        return {"shows": [dict(row) for row in rows], "total": total, "limit": limit,
+                "offset": offset, "has_more": offset + len(rows) < total}
+
+    def _phishnet_refresh_show(self, args: dict[str, Any]) -> dict[str, Any]:
+        show_date = _iso_date(args.get("show_date"), "show_date")
+        # Record intent before any network request; failure prevents the request.
+        event = self.audit.make_event(tool="phishnet_refresh_started", arguments=args,
+                                      outcome="started", result={"show_date": show_date})
+        try:
+            self.audit.write(event)
+        except (OSError, TypeError, ValueError, OverflowError, RecursionError):
+            raise SourceError("audit_failure", "External retrieval was withheld because audit writing failed.") from None
+        return self.phishnet.refresh(show_date)
+
+    def _phish_get_show_reviews(self, args: dict[str, Any]) -> dict[str, Any]:
+        date_value = _iso_date(args.get("show_date"), "show_date")
+        limit = _limit(args.get("limit", DEFAULT_LIMIT))
+        snap = self.phishnet.get(date_value)
+        return {k: snap[k] for k in ("source", "source_url", "show_date", "snapshot_id", "retrieved_at_utc", "response_sha256", "possibly_truncated_endpoints")} | {
+            "reviews": snap["reviews"][:limit], "total_in_snapshot": len(snap["reviews"]),
+            "has_more": len(snap["reviews"]) > limit}
+
+    def _phish_get_show_highlights(self, args: dict[str, Any]) -> dict[str, Any]:
+        snap = self.phishnet.get(_iso_date(args.get("show_date"), "show_date"))
+        return {k: snap[k] for k in ("source", "source_url", "show_date", "snapshot_id", "retrieved_at_utc", "response_sha256", "possibly_truncated_endpoints", "shows", "jamcharts")}
+
+    def _phish_get_external_source_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        snap = self.phishnet.get(_iso_date(args.get("show_date"), "show_date"))
+        return {k: snap[k] for k in ("source", "source_url", "show_date", "snapshot_id", "retrieved_at_utc", "response_sha256", "possibly_truncated_endpoints")}
+
+    def _phish_page(self, connection: sqlite3.Connection, args: dict[str, Any]) -> tuple[int, int, dict[str, Any]]:
+        limit = _limit(args.get("limit", DEFAULT_LIMIT))
+        offset = args.get("offset", 0)
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000:
+            raise InputError("offset must be an integer from 0 to 1000000.")
+        expected = args.get("expected_sync_id")
+        if expected is not None:
+            expected = _positive_id(expected, "expected_sync_id")
+        if offset and expected is None:
+            raise InputError("expected_sync_id is required for subsequent pages.")
+        connection.execute("BEGIN")
+        sync = connection.execute("SELECT id, finished_at_utc FROM phish_sync_runs WHERE status='succeeded' AND finished_at_utc IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+        if sync is None:
+            raise CatalogError("catalog_unavailable", "The local catalog has no completed successful sync.")
+        if expected is not None and expected != sync["id"]:
+            raise CatalogError("snapshot_changed", "The catalog has changed; restart from the first page.")
+        return limit, offset, {"catalog_sync_id": sync["id"], "catalog_synced_at": sync["finished_at_utc"]}
+
+    def _phish_statistics(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with closing(self._phish_connection()) as connection:
+                limit, offset, metadata = self._phish_page(connection, args)
+                if tool == "phish_list_years":
+                    query = "SELECT substr(show_date,1,4) AS year, COUNT(*) AS show_count FROM phish_shows GROUP BY substr(show_date,1,4)"
+                    params: list[Any] = []
+                    key, order = "years", "year ASC"
+                elif tool == "phish_list_venues":
+                    query = """WITH ranked AS (SELECT venue_id, venue_name, city, state, country,
+                        COUNT(*) OVER (PARTITION BY venue_id) AS show_count,
+                        ROW_NUMBER() OVER (PARTITION BY venue_id ORDER BY show_date DESC, id DESC) AS rn
+                        FROM phish_shows WHERE venue_id IS NOT NULL)
+                        SELECT venue_id, venue_name, city, state, country, show_count FROM ranked WHERE rn=1"""
+                    params = []
+                    term = args.get("query")
+                    if term is not None:
+                        term = _search_query(term).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                        query += " AND (coalesce(venue_name,'') LIKE ? ESCAPE '\\' OR coalesce(city,'') LIKE ? ESCAPE '\\')"
+                        params.extend([f"%{term}%"] * 2)
+                    for field in ("state", "country"):
+                        value = args.get(field)
+                        if value is not None:
+                            query += f" AND {field} = ? COLLATE NOCASE"
+                            params.append(_search_query(value, field))
+                    metadata["unidentified_venue_show_count"] = connection.execute("SELECT COUNT(*) FROM phish_shows WHERE venue_id IS NULL").fetchone()[0]
+                    key, order = "venues", "lower(coalesce(venue_name,'')), venue_id"
+                else:
+                    where, params = [], []
+                    year = args.get("year")
+                    if year is not None:
+                        if isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= 2200:
+                            raise InputError("year must be an integer from 1900 to 2200.")
+                        where.append("sh.show_date >= ? AND sh.show_date < ?")
+                        params.extend([f"{year:04d}-01-01", f"{year + 1:04d}-01-01"])
+                    venue_id = args.get("venue_id")
+                    if venue_id is not None:
+                        where.append("sh.venue_id = ?")
+                        params.append(_positive_id(venue_id, "venue_id"))
+                    predicate = " AND ".join(where) if where else "1=1"
+                    query = f"""SELECT s.id AS song_id, s.title, s.slug, COUNT(DISTINCT t.id) AS track_count
+                        FROM phish_songs s JOIN phish_track_songs ts ON ts.song_id=s.id
+                        JOIN phish_tracks t ON t.id=ts.track_id JOIN phish_shows sh ON sh.id=t.show_id
+                        WHERE {predicate} GROUP BY s.id, s.title, s.slug"""
+                    metadata["unassociated_track_count"] = connection.execute(
+                        f"""SELECT COUNT(*) FROM phish_tracks t JOIN phish_shows sh ON sh.id=t.show_id
+                            WHERE {predicate} AND NOT EXISTS (SELECT 1 FROM phish_track_songs ts WHERE ts.track_id=t.id)""", params).fetchone()[0]
+                    metadata["metric_definition"] = "Distinct locally associated tracks per song; medleys count for each linked song. Phish.in exclusion rules are not applied; this is not the official Phish.in statistic."
+                    key, order = "songs", "track_count DESC, lower(title), song_id"
+                total = connection.execute(f"SELECT COUNT(*) FROM ({query})", params).fetchone()[0]
+                rows = connection.execute(f"SELECT * FROM ({query}) ORDER BY {order} LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+                return {**metadata, key: [dict(row) for row in rows], "total": total, "limit": limit,
+                        "offset": offset, "has_more": offset + len(rows) < total}
+        except (sqlite3.Error, FileNotFoundError) as exc:
+            raise CatalogError("catalog_unavailable", "The local catalog is missing or incompatible.") from exc
+
+    def _phish_list_years(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._phish_statistics("phish_list_years", args)
+
+    def _phish_list_venues(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._phish_statistics("phish_list_venues", args)
+
+    def _phish_song_frequency(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._phish_statistics("phish_song_frequency", args)
 
     def _phish_find_shows(self, args: dict[str, Any]) -> dict[str, Any]:
         query = args.get("query")
@@ -193,6 +426,33 @@ class LookupService:
             return {"error": {"code": "not_found", "message": f"No show was found for {show_date}."}}
         return {"shows": shows}
 
+    def _phish_count_shows_by_state(self, args: dict[str, Any]) -> dict[str, Any]:
+        state = args.get("state")
+        if not isinstance(state, str) or len(state) != 2 or not state.isascii() or not state.isalpha():
+            raise InputError("state must be a two-letter ASCII state or province code.")
+        state = state.upper()
+        year = args.get("year")
+        if isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= 2200:
+            raise InputError("year must be an integer from 1900 to 2200.")
+        country = args.get("country")
+        if country is not None:
+            country = _search_query(country, "country")
+        where = "state = ? COLLATE NOCASE AND show_date >= ? AND show_date < ?"
+        params: list[Any] = [state, f"{year:04d}-01-01", f"{year + 1:04d}-01-01"]
+        if country is not None:
+            where += " AND country = ? COLLATE NOCASE"
+            params.append(country)
+        with closing(self._phish_connection()) as connection:
+            connection.execute("BEGIN")
+            count = connection.execute(f"SELECT COUNT(*) FROM phish_shows WHERE {where}", params).fetchone()[0]
+            rows = connection.execute(
+                f"""SELECT id, show_date, venue_name, city, state, country
+                    FROM phish_shows WHERE {where} ORDER BY show_date, id LIMIT 50""",
+                params,
+            ).fetchall()
+        return {"state": state, "year": year, "country": country, "count": count,
+                "shows": [dict(row) for row in rows], "has_more": count > len(rows)}
+
     def _phish_find_song_performances(self, args: dict[str, Any]) -> dict[str, Any]:
         term = _search_query(args.get("query"))
         limit = _limit(args.get("limit", DEFAULT_LIMIT))
@@ -211,6 +471,55 @@ class LookupService:
                 (f"%{escaped}%", limit),
             ).fetchall()
         return {"performances": [dict(row) for row in rows]}
+
+    def _phish_get_show_audio(self, args: dict[str, Any]) -> dict[str, Any]:
+        show_date = _iso_date(args.get("show_date"), "show_date")
+        with closing(self._phish_connection()) as connection:
+            rows = connection.execute("""SELECT id AS show_id, show_date, venue_name, city, state, country, audio_status
+                FROM phish_shows WHERE show_date=? ORDER BY id""", (show_date,)).fetchall()
+        if not rows:
+            return {"error": {"code": "not_found", "message": f"No show was found for {show_date}."}}
+        return {"source": "Phish.in", "link_type": "show page", "availability_note": "Audio status is from the local catalog; the page and audio may have changed.",
+                "shows": [{**dict(row), "url": f"https://phish.in/{show_date}"} for row in rows]}
+
+    def _phish_find_song_audio(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = _search_query(args.get("query"))
+        show_date = args.get("show_date")
+        if show_date is not None:
+            show_date = _iso_date(show_date, "show_date")
+        limit = _limit(args.get("limit", DEFAULT_LIMIT))
+        offset = args.get("offset", 0)
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000:
+            raise InputError("offset must be an integer from 0 to 1000000.")
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        term = f"%{escaped}%"
+        where = """(t.title LIKE ? ESCAPE '\\' OR EXISTS (
+            SELECT 1 FROM phish_track_songs ts JOIN phish_songs s ON s.id=ts.song_id
+            WHERE ts.track_id=t.id AND s.title LIKE ? ESCAPE '\\'))"""
+        params: list[Any] = [term, term]
+        if show_date is not None:
+            where += " AND sh.show_date=?"
+            params.append(show_date)
+        with closing(self._phish_connection()) as connection:
+            connection.execute("BEGIN")
+            base = " FROM phish_tracks t JOIN phish_shows sh ON sh.id=t.show_id WHERE " + where
+            total = connection.execute("SELECT COUNT(*)" + base, params).fetchone()[0]
+            rows = connection.execute("""SELECT sh.id AS show_id, sh.show_date, sh.venue_name, sh.city, sh.state,
+                t.id AS track_id, t.title AS track_title, t.slug, t.set_name, t.position, t.audio_status""" + base +
+                " ORDER BY sh.show_date, sh.id, t.position, t.id LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+        tracks = []
+        for row in rows:
+            track = dict(row)
+            slug = track.pop("slug")
+            try:
+                safe_date = _iso_date(track["show_date"], "show_date")
+            except InputError:
+                safe_date = None
+            track["url"] = (f"https://phish.in/{safe_date}/{slug}" if safe_date and isinstance(slug, str)
+                            and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug, flags=re.ASCII) else None)
+            tracks.append(track)
+        return {"source": "Phish.in", "link_type": "track page", "availability_note": "Audio status is from the local catalog; a medley links to the containing track. Page and audio availability may have changed.",
+                "tracks": tracks, "total": total, "limit": limit, "offset": offset, "has_more": offset + len(tracks) < total}
 
     def _audit_events(self):
         """Read complete events from the configured local JSONL audit log."""
@@ -240,12 +549,7 @@ class LookupService:
         return {"events": list(reversed(matches))}
 
     def _audit_get_event(self, args: dict[str, Any]) -> dict[str, Any]:
-        request_id = args.get("request_id")
-        try:
-            if not isinstance(request_id, str) or str(UUID(request_id)) != request_id:
-                raise ValueError
-        except ValueError as exc:
-            raise InputError("request_id must be a canonical lowercase UUID.") from exc
+        request_id = _uuid(args.get("request_id"), "request_id")
         for event in self._audit_events():
             if event.get("request_id") == request_id:
                 return {"event": event}
@@ -280,12 +584,27 @@ class LookupService:
         """Call one allowlisted operation and record its result or failure."""
         operations: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "find_customers": self._find_customers,
+            "find_customers_by_prefix": self._find_customers_by_prefix,
+            "count_customers": self._count_customers,
             "list_customer_orders": self._list_customer_orders,
             "get_order_details": self._get_order_details,
             "phish_find_shows": self._phish_find_shows,
             "phish_get_show": self._phish_get_show,
+            "phish_count_shows_by_state": self._phish_count_shows_by_state,
             "phish_find_song_performances": self._phish_find_song_performances,
+            "phish_get_show_audio": self._phish_get_show_audio,
+            "phish_find_song_audio": self._phish_find_song_audio,
+            "phish_list_years": self._phish_list_years,
+            "phish_list_venues": self._phish_list_venues,
+            "phish_song_frequency": self._phish_song_frequency,
+            "phish_add_attended_show": self._phish_add_attended_show,
+            "phish_list_attended_shows": self._phish_list_attended_shows,
+            "phishnet_refresh_show": self._phishnet_refresh_show,
+            "phish_get_show_reviews": self._phish_get_show_reviews,
+            "phish_get_show_highlights": self._phish_get_show_highlights,
+            "phish_get_external_source_status": self._phish_get_external_source_status,
             "audit_find_events": self._audit_find_events,
+            "audit_record_question": self._audit_record_question,
             "audit_get_event": self._audit_get_event,
             "audit_phish_sync_runs": self._audit_phish_sync_runs,
             "audit_phish_sync_pages": self._audit_phish_sync_pages,
@@ -296,6 +615,18 @@ class LookupService:
             operation = operations.get(tool)
             if operation is None:
                 raise InputError("Unsupported tool.")
+            question_id = arguments.get("question_id")
+            if self.require_question_id and tool != "audit_record_question" and question_id is None:
+                raise InputError("Record the user's question with audit_record_question first, then pass its request ID as question_id.")
+            if question_id is not None:
+                question_id = _uuid(question_id, "question_id")
+                if not any(
+                    event.get("request_id") == question_id
+                    and event.get("tool") == "audit_record_question"
+                    and event.get("outcome") == "success"
+                    for event in self._audit_events()
+                ):
+                    raise InputError("question_id does not identify a recorded question.")
             data = operation(arguments)
             if "error" in data:
                 response = {"ok": False, "error": data["error"]}
@@ -305,6 +636,10 @@ class LookupService:
                 response = {"ok": True, "data": data}
                 outcome = "success"
                 error = None
+        except (CatalogError, SourceError) as exc:
+            response = {"ok": False, "error": {"code": exc.code, "message": str(exc)}}
+            outcome = "error"
+            error = response["error"]
         except InputError as exc:
             response = {"ok": False, "error": {"code": "invalid_input", "message": str(exc)}}
             outcome = "invalid_input"
@@ -322,5 +657,8 @@ class LookupService:
         try:
             self.audit.write(event)
         except (OSError, TypeError, ValueError, OverflowError, RecursionError):
-            return {"ok": False, "error": {"code": "audit_failure", "message": "The lookup was withheld because its audit record could not be written."}}
+            message = ("Attendance may have been saved, but its completion audit failed; retrying the same show is safe."
+                       if tool == "phish_add_attended_show" and outcome == "success" else
+                       "The result was withheld because its audit record could not be written.")
+            return {"ok": False, "error": {"code": "audit_failure", "message": message}}
         return response

@@ -6,7 +6,8 @@
       "env": {
         "LOCAL_DATA_MCP_DB_PATH": "<PROJECT_ROOT>\\data\\mock.sqlite",
         "LOCAL_DATA_MCP_AUDIT_PATH": "<PROJECT_ROOT>\\data\\audit.jsonl",
-        "LOCAL_DATA_MCP_PHISH_DB_PATH": "<PROJECT_ROOT>\\data\\phish.sqlite"
+        "LOCAL_DATA_MCP_PHISH_DB_PATH": "<PROJECT_ROOT>\\data\\phish.sqlite",
+        "LOCAL_DATA_MCP_ATTENDANCE_DB_PATH": "<PROJECT_ROOT>\\data\\attendance.sqlite"
       }
     }
   }
