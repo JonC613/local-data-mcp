@@ -176,11 +176,12 @@ class LookupService:
         return open_readonly(self.phish_database_path)
 
     def _attendance_path(self) -> Path:
-        path = self.attendance_database_path
+        path = self.attendance_database_path.expanduser().resolve()
         protected = {self.database_path.expanduser().resolve(), self.audit.path.expanduser().resolve()}
         if self.phish_database_path is not None:
             protected.add(self.phish_database_path.expanduser().resolve())
-        if path in protected:
+        if path in protected or any(path.exists() and other.exists() and os.path.samefile(path, other)
+                                    for other in protected):
             raise InputError("Attendance database path must differ from catalog, mock database and audit paths.")
         return path
 

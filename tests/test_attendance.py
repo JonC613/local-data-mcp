@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -65,6 +66,16 @@ class AttendanceTests(unittest.TestCase):
         self.service.audit.write = lambda event: (_ for _ in ()).throw(PermissionError("denied"))
         self.assertEqual("audit_failure", self.call("phish_add_attended_show", show_date="1999-07-24")["error"]["code"])
         self.assertFalse(self.attendance.exists())
+
+    def test_hardlink_to_catalog_is_rejected(self):
+        alias = self.root / "catalog-alias.sqlite"
+        try:
+            os.link(self.catalog, alias)
+        except OSError as exc:
+            self.skipTest(f"Hard links unavailable: {exc}")
+        self.service.attendance_database_path = alias
+        result = self.call("phish_add_attended_show", show_date="1999-07-24")
+        self.assertEqual("invalid_input", result["error"]["code"])
 
     def test_completion_failure_reports_possible_save_and_retry(self):
         original = self.service.audit.write
